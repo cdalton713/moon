@@ -33,7 +33,7 @@ utilize this command.
 
 This command may seem like magic, but it's relative simple thanks to moon's infrastructure and its
 project graph. When the command is ran, we generate 2 skeleton structures in `.moon/docker` (be sure
-to gitignore this). One for the workspace, and the other for sources.
+to gitignore this). One for configs, and the other for sources.
 
 :::warning
 
@@ -43,9 +43,9 @@ fail.
 
 :::
 
-### Workspace
+### Configs skeleton
 
-The workspace skeleton mirrors the project folder structure of the repository 1:1, and only copies
+The configs skeleton (`.moon/docker/configs`) mirrors the project folder structure of the repository 1:1, and only copies
 files required for dependencies to install. This is typically manifests (`package.json`), lockfiles
 (`yarn.lock`, etc), other critical configs, and `.moon` itself. This is necessary for package
 managers to install dependencies (otherwise they will fail), and for dependencies to be layer cached
@@ -54,7 +54,7 @@ in Docker.
 An example of this skeleton using Yarn may look like the following:
 
 ```
-.moon/docker/workspace/
+.moon/docker/configs/
 ├── .moon/
 ├── .yarn/
 ├── apps/
@@ -71,12 +71,13 @@ An example of this skeleton using Yarn may look like the following:
 │       └── package.json
 ├── .yarnrc.yml
 ├── package.json
-└── yarn.lock
+├── yarn.lock
+└── dockerManifest.json
 ```
 
-### Sources
+### Sources skeleton
 
-The sources skeleton is not a 1:1 mirror of the repository, and instead is the source files of a
+The sources skeleton (`.moon/docker/sources`) is not a 1:1 mirror of the repository, and instead is the source files of a
 project (passed as an argument to the command), and all of its dependencies. This allows
 [`moon run`](../run) and other commands to work within the `Dockerfile`, and avoid having to
 `COPY . .` the entire repository.
@@ -94,19 +95,116 @@ Using our example workspace above, our sources skeleton would look like the foll
 |       ├── package.json
 |       ├── tsconfig.json
 │       └── (anything else)
-└── packages/
-    ├── foo/
-    │   ├── lib/
-    │   ├── src/
-    │   ├── package.json
-    │   ├── tsconfig.json
-    │   └── (anything else)
-    └── baz/
-        ├── lib/
-        ├── src/
-        ├── package.json
-        ├── tsconfig.json
-        └── (anything else)
+├── packages/
+│   ├── foo/
+│   │   ├── lib/
+│   │   ├── src/
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   └── (anything else)
+│   └── baz/
+│       ├── lib/
+│       ├── src/
+│       ├── package.json
+│       ├── tsconfig.json
+│       └── (anything else)
+└── dockerManifest.json
 ```
+
+## Internals
+
+This section provides a detailed explanation of what happens internally when `moon docker scaffold` is executed.
+
+### Entry point and workflow
+
+The command is implemented in `crates/app/src/commands/docker/scaffold.rs` with the following high-level flow:
+
+1. **Pre-flight check**: Validates that `.moon/cache` is ignored in `.dockerignore` to avoid interoperability issues
+2. **Clean slate**: Removes and recreates the `.moon/docker` directory to eliminate stale files
+3. **Build project graph**: Loads the project graph which contains all projects and their dependencies
+4. **Scaffold configs**: Creates the configs skeleton for all projects in the workspace
+5. **Scaffold sources**: Creates the sources skeleton for the specified projects and their dependencies
+6. **Create manifest**: Generates `dockerManifest.json` tracking which projects were included
+
+### Phase 1: Configs scaffolding
+
+The configs phase (`scaffold_configs`) creates a complete skeleton of the workspace configuration:
+
+#### For each project:
+1. **Gather globs**: Collects file patterns from multiple sources in priority order:
+   - Toolchain plugins (via `define_docker_metadata_all` hook) - each toolchain can specify files to include
+   - Project-level `docker.scaffold.configs_phase_globs` configuration (if set)
+   - Workspace-level `docker.scaffold.configs_phase_globs` configuration (as fallback)
+   - Default: `moon.{ext}` files (like `moon.yml`, `moon.json`)
+
+2. **Run toolchain hooks**: Calls `scaffold_docker` on each enabled toolchain plugin for the project, passing:
+   - Phase: `ScaffoldDockerPhase::Configs`
+   - Input directory: the project's root directory
+   - Output directory: the corresponding path under `.moon/docker/configs`
+   - Toolchain config: merged project and workspace toolchain settings
+
+3. **Copy files**: Uses the gathered globs to copy matching files from the project root to the docker configs directory
+
+#### At workspace root:
+1. **Run root toolchain hooks**: Similar to project-level, but for workspace-wide toolchain configuration
+2. **Copy moon configuration**: Specifically copies:
+   - `.moon/*.{yml,json,toml}` - workspace configuration files
+   - `.moon/tasks/**/*.{yml,json,toml}` - inherited task configurations
+
+The result is a minimal filesystem containing only configuration files needed for dependency installation.
+
+### Phase 2: Sources scaffolding
+
+The sources phase (`scaffold_sources`) creates a targeted skeleton with actual source code:
+
+#### For each specified project (recursively):
+1. **Dependency resolution**: Recursively walks the project graph to find all dependencies:
+   - Starts with the projects specified on the command line
+   - For each project, processes all its dependencies (except root-scoped dependencies)
+   - Uses a visited set to avoid processing the same project twice
+   - Root-scoped dependencies are skipped to avoid pulling in the entire repository
+
+2. **Gather globs**: Similar to configs phase, but uses `sources_phase_globs`:
+   - Toolchain plugins specify source file patterns
+   - Project-level `docker.scaffold.sources_phase_globs` (if configured)
+   - Workspace-level `docker.scaffold.sources_phase_globs` (as fallback)
+   - Default for projects: `**/*` (all files)
+   - Default for workspace root: empty (to avoid copying everything)
+
+3. **Run toolchain hooks**: Calls `scaffold_docker` with `ScaffoldDockerPhase::Sources`
+4. **Copy source files**: Copies all matching files from the project directory
+
+#### Manifest creation:
+After scaffolding, creates `dockerManifest.json` containing:
+- `focused_projects`: Set of project IDs that were explicitly scaffolded (specified on command line + dependencies)
+- `unfocused_projects`: All other projects in the workspace
+
+This manifest is written to both:
+- `.moon/docker/sources/dockerManifest.json`
+- `.moon/docker/configs/dockerManifest.json` (for staged builds)
+
+### Glob resolution and file copying
+
+The `gather_globs` function is central to determining which files get copied:
+
+1. **Toolchain metadata**: Each toolchain plugin can contribute glob patterns via `define_docker_metadata` hook
+2. **Configuration overrides**: Projects can override workspace-level globs for fine-grained control
+3. **Phase-specific globs**: Separate glob sets for configs vs sources allow different file sets per phase
+4. **Glob execution**: Uses `glob::walk_files` to find matching files, then copies them preserving directory structure
+
+### Toolchain plugin integration
+
+The command extensively uses the toolchain plugin system:
+
+- **`define_docker_metadata_all`**: Queries all toolchains for files they need included (e.g., Node.js plugin might request `package.json`, `package-lock.json`)
+- **`scaffold_docker_many`**: Allows each toolchain to perform custom setup actions during scaffolding (e.g., Node.js might modify lockfiles, Go might set up vendor directories)
+
+Each plugin receives:
+- The phase being executed (configs or sources)
+- Input and output directories
+- Merged toolchain configuration
+- Optional project context
+
+This extensibility allows moon to support different language ecosystems with their unique requirements.
 
 [graph]: ../../config/workspace#projects
